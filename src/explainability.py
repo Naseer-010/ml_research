@@ -46,6 +46,8 @@ except ImportError:
     _SHAP_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+logging.getLogger("shap").setLevel(logging.WARNING)
+logging.getLogger("numba").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -171,23 +173,46 @@ def _get_prediction_function(model: Any) -> Callable[[np.ndarray], np.ndarray]:
     if hasattr(model, "predict_proba"):
         def predict_proba_fn(data: np.ndarray) -> np.ndarray:
             p = model.predict_proba(data)
-            return p[:, 1] if p.ndim == 2 and p.shape[1] > 1 else p.ravel()
+            return p[:, 1] if (p.ndim == 2 and p.shape[1] > 1) else p.ravel()
         return predict_proba_fn
 
     if callable(model) and hasattr(model, "forward"):
         # PyTorch Module
         def torch_predict_fn(data: np.ndarray) -> np.ndarray:
             import torch
-            inp = torch.as_tensor(data, dtype=torch.float32)
+            is_quant = any(
+                "quantized" in m.__class__.__module__.lower() or "quantized" in m.__class__.__name__.lower()
+                for m in model.modules()
+            )
+            if is_quant:
+                dev = torch.device("cpu")
+                model.cpu()
+            else:
+                params = list(model.parameters())
+                dev = params[0].device if params else torch.device("cpu")
+
+            inp = torch.as_tensor(data, dtype=torch.float32, device=dev)
             model.eval()
             with torch.no_grad():
-                out = model(inp)
+                try:
+                    out = model(inp)
+                except Exception:
+                    # In case of device mismatch or quantized operator issues, fall back to CPU
+                    model.cpu()
+                    inp_cpu = torch.as_tensor(data, dtype=torch.float32, device="cpu")
+                    out = model(inp_cpu)
+
                 if out.ndim > 1 and out.shape[1] > 1:
                     out = torch.softmax(out, dim=1)[:, 1]
                 elif out.ndim > 1 and out.shape[1] == 1:
-                    out = torch.sigmoid(out)
+                    # Check if sigmoid is needed (e.g. outputs raw logits outside [0, 1])
+                    if (out < 0).any() or (out > 1).any():
+                        out = torch.sigmoid(out)
                 return out.cpu().numpy().ravel()
         return torch_predict_fn
+
+    if hasattr(model, "get_model"):
+        return _get_prediction_function(model.get_model())
 
     if hasattr(model, "predict"):
         return lambda data: np.asarray(model.predict(data), dtype=float).ravel()
@@ -200,26 +225,57 @@ def _fallback_permutation_importance(
     X: np.ndarray,
     feature_names: List[str],
 ) -> FallbackExplanation:
-    """Compute permutation importance as a fallback when SHAP cannot be used."""
-    logger.info("Computing feature importance via sklearn permutation_importance.")
-    try:
-        # Generate pseudo-ground truth from model predictions
-        if hasattr(model, "predict"):
-            y_pseudo = model.predict(X)
-        elif hasattr(model, "predict_proba"):
-            y_pseudo = (model.predict_proba(X)[:, 1] >= 0.5).astype(int)
-        else:
-            y_pseudo = np.zeros(len(X), dtype=int)
+    """Compute permutation importance as a fallback when SHAP cannot be used.
 
-        res = permutation_importance(
-            model,
-            X,
-            y_pseudo,
-            n_repeats=5,
-            random_state=config.RANDOM_SEEDS[0],
-            n_jobs=-1,
-        )
-        mean_imp = res.importances_mean
+    Supports scikit-learn estimators, PyTorch modules, and model wrappers.
+    Directly computes feature score variations via feature shuffling.
+    """
+    logger.info("Computing feature importance via permutation importance.")
+    try:
+        # Check if model natively supports sklearn permutation_importance (has fit method)
+        if hasattr(model, "fit"):
+            if hasattr(model, "predict"):
+                y_pseudo = model.predict(X)
+            elif hasattr(model, "predict_proba"):
+                y_pseudo = (model.predict_proba(X)[:, 1] >= 0.5).astype(int)
+            else:
+                y_pseudo = np.zeros(len(X), dtype=int)
+
+            res = permutation_importance(
+                model,
+                X,
+                y_pseudo,
+                n_repeats=5,
+                random_state=config.RANDOM_SEEDS[0],
+                n_jobs=-1,
+            )
+            mean_imp = res.importances_mean
+        else:
+            # Model is a PyTorch Module or Wrapper without fit() - compute permutation importance directly
+            predict_fn = _get_prediction_function(model)
+            base_preds = predict_fn(X)
+            n_features = X.shape[1]
+            mean_imp = np.zeros(n_features, dtype=float)
+            rng = np.random.RandomState(config.RANDOM_SEEDS[0])
+            n_eval = min(len(X), 300)
+            X_eval = X[:n_eval]
+            base_eval = base_preds[:n_eval]
+
+            for j in range(n_features):
+                col_diffs = []
+                for _ in range(3):
+                    X_perm = X_eval.copy()
+                    X_perm[:, j] = rng.permutation(X_perm[:, j])
+                    perm_preds = predict_fn(X_perm)
+                    col_diffs.append(np.mean(np.abs(perm_preds - base_eval)))
+                mean_imp[j] = float(np.mean(col_diffs))
+
+            total_imp = np.sum(mean_imp)
+            if total_imp > 0:
+                mean_imp = mean_imp / total_imp
+            else:
+                mean_imp = np.ones(n_features, dtype=float) / n_features
+
     except Exception as exc:
         logger.warning("Permutation importance failed (%s); using uniform attribution.", exc)
         mean_imp = np.ones(X.shape[1], dtype=float) / X.shape[1]

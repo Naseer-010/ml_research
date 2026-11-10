@@ -237,11 +237,33 @@ def prune_neural_network(model: torch.nn.Module, level: float) -> torch.nn.Modul
     return model_copy
 
 
+def _quantize_weights_simulated(model: torch.nn.Module) -> torch.nn.Module:
+    """Simulate INT8 weight quantization by scaling and clamping float weights.
+
+    Provides a fail-proof fallback that runs identically on CPU and GPU without
+    relying on platform-specific C++ quantization kernels.
+    """
+    model_copy = copy.deepcopy(model)
+    model_copy.eval()
+    with torch.no_grad():
+        for module in model_copy.modules():
+            if isinstance(module, nn.Linear):
+                w = module.weight.data
+                max_val = torch.max(torch.abs(w)).item()
+                if max_val > 0:
+                    scale = max_val / 127.0
+                    w_q = torch.clamp(torch.round(w / scale), -128, 127)
+                    module.weight.data = w_q * scale
+    logger.info("Applied simulated INT8 weight quantization to Linear layers")
+    return model_copy
+
+
 def quantize_neural_network(model: torch.nn.Module) -> torch.nn.Module:
     """Apply dynamic INT8 quantization to Linear layers using torch.ao.quantization.
 
     Converts 32-bit floating point weights of Linear layers into 8-bit integers
     for reduced memory footprint and accelerated CPU inference.
+    Dynamic quantization in PyTorch is CPU-only, so the model is transferred to CPU first.
 
     Args:
         model: PyTorch neural network module.
@@ -249,21 +271,47 @@ def quantize_neural_network(model: torch.nn.Module) -> torch.nn.Module:
     Returns:
         A new dynamically quantized PyTorch module.
     """
-    model_copy = copy.deepcopy(model)
+    # PyTorch dynamic quantization is strictly a CPU operator
+    model_copy = copy.deepcopy(model).cpu()
     model_copy.eval()
+
+    # Configure quantization engine if available
+    try:
+        if hasattr(torch.backends, "quantized"):
+            supported = getattr(torch.backends.quantized, "supported_engines", [])
+            if "fbgemm" in supported:
+                torch.backends.quantized.engine = "fbgemm"
+            elif "qnnpack" in supported:
+                torch.backends.quantized.engine = "qnnpack"
+    except Exception as eng_exc:
+        logger.debug("Failed setting quantized engine: %s", eng_exc)
 
     try:
         from torch.ao.quantization import quantize_dynamic
     except ImportError:
         from torch.quantization import quantize_dynamic  # type: ignore
 
-    quantized_model = quantize_dynamic(
-        model_copy,
-        {nn.Linear},
-        dtype=torch.qint8,
-    )
-    logger.info("Applied dynamic INT8 quantization to Linear layers")
-    return quantized_model
+    try:
+        quantized_model = quantize_dynamic(
+            model_copy,
+            {nn.Linear},
+            dtype=torch.qint8,
+        )
+        # Verify 1-sample test forward pass on CPU to confirm packed parameters are valid
+        first_linear = next((m for m in quantized_model.modules() if hasattr(m, "in_features")), None)
+        in_dim = getattr(first_linear, "in_features", 14)
+        dummy_x = torch.zeros((1, in_dim), dtype=torch.float32)
+        with torch.no_grad():
+            _ = quantized_model(dummy_x)
+
+        logger.info("Applied dynamic INT8 quantization to Linear layers (CPU)")
+        return quantized_model
+    except Exception as exc:
+        logger.warning(
+            "Dynamic INT8 quantization failed (%s); using simulated INT8 weight quantization fallback.",
+            exc,
+        )
+        return _quantize_weights_simulated(model_copy)
 
 
 def fp16_neural_network(model: torch.nn.Module) -> torch.nn.Module:

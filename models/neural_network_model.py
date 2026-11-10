@@ -78,6 +78,9 @@ class TabularMLP(nn.Module):
         Returns:
             Output probability tensor of shape (batch_size, 1).
         """
+        params = list(self.parameters())
+        if params and x.device != params[0].device:
+            x = x.to(params[0].device)
         return self.network(x)
 
 
@@ -291,12 +294,23 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
             X_arr = X_arr.reshape(1, -1)
 
         self.model.eval()
-        device = torch.device("cpu") if self.is_quantized else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        try:
-            self.model.to(device)
-        except Exception:
+
+        # Dynamic quantized Linear layers in PyTorch ONLY execute on CPU
+        is_quant = self.is_quantized or any(
+            "quantized" in m.__class__.__module__.lower() or "quantized" in m.__class__.__name__.lower()
+            for m in self.model.modules()
+        )
+
+        if is_quant:
             device = torch.device("cpu")
-            self.model.to(device)
+            self.model.cpu()
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            try:
+                self.model.to(device)
+            except Exception:
+                device = torch.device("cpu")
+                self.model.cpu()
 
         batch_size = 4096 if (device.type == "cuda") else 2048
         all_probs: List[np.ndarray] = []
@@ -308,7 +322,17 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
                 batch_x = torch.from_numpy(X_arr[start_idx:end_idx]).to(device)
                 if is_half:
                     batch_x = batch_x.half()
-                preds = self.model(batch_x)
+                try:
+                    preds = self.model(batch_x)
+                except Exception:
+                    # Fallback to CPU execution if device mismatch or kernel error occurs
+                    self.model.cpu()
+                    device = torch.device("cpu")
+                    batch_x_cpu = torch.from_numpy(X_arr[start_idx:end_idx]).cpu()
+                    if is_half:
+                        batch_x_cpu = batch_x_cpu.half()
+                    preds = self.model(batch_x_cpu)
+
                 probs = preds.squeeze(-1).cpu().numpy()
                 if probs.ndim == 0:
                     probs = probs.reshape(1)
@@ -334,6 +358,8 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
 
         compressed_model = compress_neural_network(self.model, level=level, mode=mode)
         is_quant = mode in ("quantize_only", "prune+quantize")
+        if is_quant:
+            compressed_model.cpu()
         new_wrapper = NeuralNetworkModelWrapper(
             seed=self.seed,
             model=compressed_model,

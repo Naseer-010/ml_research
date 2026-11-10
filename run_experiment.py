@@ -61,6 +61,10 @@ logging.basicConfig(
     format=config.LOG_FORMAT,
     datefmt=getattr(config, "LOG_DATEFMT", "%H:%M:%S"),
 )
+# Silence verbose third-party loggers to keep output clean and legible
+logging.getLogger("shap").setLevel(logging.WARNING)
+logging.getLogger("numba").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -324,8 +328,12 @@ def _save_shap_values(
     n_samples = min(500, X_test.shape[0])
     X_sample = X_test[:n_samples]
 
+    # For tree models pass the underlying scikit-learn estimator for TreeExplainer;
+    # For neural network, pass the wrapper directly for robust batched probability evaluation
+    explainer_target = model.get_model() if model_name in ("RandomForest", "GradientBoosting") else model
+
     shap_vals = compute_shap_values(
-        model.get_model(), X_sample, feature_names,
+        explainer_target, X_sample, feature_names,
         model_type=model.model_type,
     )
 
