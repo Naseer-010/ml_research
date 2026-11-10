@@ -27,12 +27,12 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
+if not logger.handlers and not logging.getLogger().handlers:
     _handler = logging.StreamHandler()
-    _formatter = logging.Formatter(config.LOG_FORMAT)
+    _formatter = logging.Formatter(config.LOG_FORMAT, datefmt=getattr(config, "LOG_DATEFMT", "%H:%M:%S"))
     _handler.setFormatter(_formatter)
     logger.addHandler(_handler)
-    logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
 
 # Mapping from UCI Statlog German Credit Attribute numbers to descriptive names
 GERMAN_ATTRIBUTE_MAP: Dict[str, str] = {
@@ -57,6 +57,34 @@ GERMAN_ATTRIBUTE_MAP: Dict[str, str] = {
     "Attribute19": "own_telephone",
     "Attribute20": "foreign_worker",
     "Attribute21": "class",
+}
+
+# Mapping from UCI Default of Credit Card Clients column codes (X1..X23, Y) to descriptive names
+CREDIT_DEFAULT_COLUMN_MAP: Dict[str, str] = {
+    "X1": "LIMIT_BAL",
+    "X2": "SEX",
+    "X3": "EDUCATION",
+    "X4": "MARRIAGE",
+    "X5": "AGE",
+    "X6": "PAY_0",
+    "X7": "PAY_2",
+    "X8": "PAY_3",
+    "X9": "PAY_4",
+    "X10": "PAY_5",
+    "X11": "PAY_6",
+    "X12": "BILL_AMT1",
+    "X13": "BILL_AMT2",
+    "X14": "BILL_AMT3",
+    "X15": "BILL_AMT4",
+    "X16": "BILL_AMT5",
+    "X17": "BILL_AMT6",
+    "X18": "PAY_AMT1",
+    "X19": "PAY_AMT2",
+    "X20": "PAY_AMT3",
+    "X21": "PAY_AMT4",
+    "X22": "PAY_AMT5",
+    "X23": "PAY_AMT6",
+    "Y": "default.payment",
 }
 
 # OpenML fallback dataset IDs/names if ucimlrepo is unreachable
@@ -238,7 +266,7 @@ def _strip_string_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
 
     for col in df.columns:
-        if df[col].dtype == "object":
+        if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
             df[col] = df[col].apply(
                 lambda val: val.strip() if isinstance(val, str) else val
             )
@@ -445,6 +473,7 @@ def _clean_german_credit(df: pd.DataFrame) -> pd.DataFrame:
 def _clean_credit_default(df: pd.DataFrame) -> pd.DataFrame:
     """Clean and standardize the Default of Credit Card Clients dataset.
 
+    - Maps X1-X23 column codes to standard feature names (e.g., X2 -> SEX).
     - Sensitive attributes: 'SEX', 'EDUCATION', 'MARRIAGE' are preserved.
     - Target column 'default.payment' binarized: 1 (default) -> 1, 0 -> 0.
     - Dropping client ID identifier column if present.
@@ -466,6 +495,16 @@ def _clean_credit_default(df: pd.DataFrame) -> pd.DataFrame:
     id_cols = [c for c in df.columns if c.strip().upper() == "ID"]
     if id_cols:
         df = df.drop(columns=id_cols)
+
+    # Map UCI column codes (X1..X23, Y) if present
+    rename_cols: Dict[str, str] = {}
+    for col in df.columns:
+        col_norm = col.strip().upper()
+        if col_norm in CREDIT_DEFAULT_COLUMN_MAP:
+            rename_cols[col] = CREDIT_DEFAULT_COLUMN_MAP[col_norm]
+    if rename_cols:
+        logger.info("Mapping Credit Default column codes: %s", rename_cols)
+        df = df.rename(columns=rename_cols)
 
     # Find target column
     target_candidates = [
@@ -501,6 +540,44 @@ def _clean_credit_default(df: pd.DataFrame) -> pd.DataFrame:
             col_rename[col] = col.upper()
     if col_rename:
         df = df.rename(columns=col_rename)
+
+    # Map demographic categories to descriptive labels if numeric
+    def map_sex(val: Any) -> str:
+        s = str(val).strip().lower()
+        if s in ["1", "1.0", "male", "m"]:
+            return "Male"
+        elif s in ["2", "2.0", "female", "f"]:
+            return "Female"
+        return str(val)
+
+    def map_education(val: Any) -> str:
+        s = str(val).strip().lower()
+        if s in ["1", "1.0", "grad school", "graduate school"]:
+            return "Grad School"
+        elif s in ["2", "2.0", "university"]:
+            return "University"
+        elif s in ["3", "3.0", "high school"]:
+            return "High School"
+        elif s in ["0", "0.0", "4", "4.0", "5", "5.0", "6", "6.0", "other", "others"]:
+            return "Other"
+        return str(val)
+
+    def map_marriage(val: Any) -> str:
+        s = str(val).strip().lower()
+        if s in ["1", "1.0", "married"]:
+            return "Married"
+        elif s in ["2", "2.0", "single"]:
+            return "Single"
+        elif s in ["0", "0.0", "3", "3.0", "other", "others"]:
+            return "Other"
+        return str(val)
+
+    if "SEX" in df.columns:
+        df["SEX"] = df["SEX"].apply(map_sex)
+    if "EDUCATION" in df.columns:
+        df["EDUCATION"] = df["EDUCATION"].apply(map_education)
+    if "MARRIAGE" in df.columns:
+        df["MARRIAGE"] = df["MARRIAGE"].apply(map_marriage)
 
     # Binarize target (0/1 integers)
     df[cfg.target_column] = (

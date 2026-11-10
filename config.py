@@ -148,4 +148,5 @@ SIGNIFICANCE_LEVEL = 0.05
 # Logging
 # ──────────────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"
-LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LOG_FORMAT = "[%(asctime)s] %(levelname)-5s | %(message)s"
+LOG_DATEFMT = "%H:%M:%S"

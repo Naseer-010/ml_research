@@ -166,19 +166,27 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
             len(train_dataset) % config.NN_BATCH_SIZE == 1
         )
 
+        pin_memory = torch.cuda.is_available()
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.NN_BATCH_SIZE,
             shuffle=True,
             drop_last=drop_last,
+            pin_memory=pin_memory,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=config.NN_BATCH_SIZE,
             shuffle=False,
+            pin_memory=pin_memory,
         )
 
-        device = torch.device("cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device_label = (
+            f"GPU: {torch.cuda.get_device_name(0)}"
+            if device.type == "cuda"
+            else "CPU"
+        )
         self.model = TabularMLP(
             input_dim=self.input_dim,
             hidden_sizes=config.NN_HIDDEN_SIZES,
@@ -189,7 +197,8 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=config.NN_LEARNING_RATE)
 
         logger.info(
-            "Training NeuralNetwork on CPU: input_dim=%d, batch_size=%d, lr=%.4f, max_epochs=%d, patience=%d",
+            "  Training NeuralNetwork on [%s] (input_dim=%d, batch_size=%d, lr=%.4f, max_epochs=%d, patience=%d)",
+            device_label,
             self.input_dim,
             config.NN_BATCH_SIZE,
             config.NN_LEARNING_RATE,
@@ -205,8 +214,8 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
             self.model.train()
             total_train_loss = 0.0
             for batch_x, batch_y in train_loader:
-                batch_x = batch_x.to(device)
-                batch_y = batch_y.to(device)
+                batch_x = batch_x.to(device, non_blocking=pin_memory)
+                batch_y = batch_y.to(device, non_blocking=pin_memory)
 
                 optimizer.zero_grad()
                 preds = self.model(batch_x)
@@ -222,13 +231,22 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
             total_val_loss = 0.0
             with torch.no_grad():
                 for batch_x, batch_y in val_loader:
-                    batch_x = batch_x.to(device)
-                    batch_y = batch_y.to(device)
+                    batch_x = batch_x.to(device, non_blocking=pin_memory)
+                    batch_y = batch_y.to(device, non_blocking=pin_memory)
                     preds = self.model(batch_x)
                     loss = criterion(preds, batch_y)
                     total_val_loss += loss.item() * len(batch_x)
 
             avg_val_loss = total_val_loss / len(val_dataset)
+
+            if epoch % 25 == 0 or epoch == 1:
+                logger.info(
+                    "    Epoch %3d/%d | Train Loss: %.4f | Val Loss: %.4f",
+                    epoch,
+                    config.NN_EPOCHS,
+                    avg_train_loss,
+                    avg_val_loss,
+                )
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -238,7 +256,7 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
                 patience_counter += 1
                 if patience_counter >= config.NN_EARLY_STOPPING_PATIENCE:
                     logger.info(
-                        "Early stopping at epoch %d. Best validation loss: %.4f",
+                        "    Early stopping at epoch %d (Best Val Loss: %.4f)",
                         epoch,
                         best_val_loss,
                     )
@@ -251,7 +269,7 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
         self._is_fitted = True
         self.compression_level = 0.0
         self.is_quantized = False
-        logger.info("NeuralNetwork training complete. Best Val Loss: %.4f", best_val_loss)
+        logger.info("  NeuralNetwork trained successfully. Best Val Loss: %.4f", best_val_loss)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Return predicted probabilities for the positive class.
@@ -273,14 +291,14 @@ class NeuralNetworkModelWrapper(BaseModelWrapper):
             X_arr = X_arr.reshape(1, -1)
 
         self.model.eval()
-        device = torch.device("cpu")
-        if not self.is_quantized:
-            try:
-                self.model.to(device)
-            except Exception:
-                pass
+        device = torch.device("cpu") if self.is_quantized else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            self.model.to(device)
+        except Exception:
+            device = torch.device("cpu")
+            self.model.to(device)
 
-        batch_size = 2048
+        batch_size = 4096 if (device.type == "cuda") else 2048
         all_probs: List[np.ndarray] = []
         is_half = any(p.dtype == torch.float16 for p in self.model.parameters())
 

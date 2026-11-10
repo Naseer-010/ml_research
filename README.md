@@ -15,6 +15,11 @@ This repository provides a modular, reproducible research implementation to inve
 
 - [Overview](#overview)
 - [Key Research Questions](#key-research-questions)
+- [Understanding the Experiment: What is Happening Internally?](#understanding-the-experiment-what-is-happening-internally)
+  - [1. What are the 120 Runs? (Runs vs. Epochs)](#1-what-are-the-120-runs-runs-vs-epochs)
+  - [2. Why Iterate Over 10 Random Seeds?](#2-why-iterate-over-10-random-seeds-statistical-rigor)
+  - [3. Lifecycle of a Single Experimental Run](#3-lifecycle-of-a-single-experimental-run-inside-run_single_experiment)
+  - [4. Hardware Acceleration: Utilizing Your GPU](#4-hardware-acceleration-utilizing-your-gpu)
 - [Repository Structure](#repository-structure)
 - [Software Architecture & SOLID Principles](#software-architecture--solid-principles)
 - [Installation & Setup](#installation--setup)
@@ -55,6 +60,111 @@ This project delivers an end-to-end experimental framework to systematically qua
 4. **Attribution Drift**: How does compression alter internal feature importances (via SHAP values) across demographic slices?
 
 ---
+
+## Understanding the Experiment: What is Happening Internally?
+
+If you are running `python run_experiment.py` and seeing counters like `[RUN 82/120]`, this section breaks down the entire internal architecture, execution hierarchy, and scientific reasoning behind the protocol.
+
+### 1. What are the 120 Runs? (Runs vs. Epochs)
+
+It is crucial to distinguish between an **Experimental Run** and a **Training Epoch**:
+
+* **What is an Epoch?**
+  An **epoch** is a single pass through the training dataset during gradient descent optimization for an individual model. For example, our PyTorch Neural Network trains for up to **100 epochs** (with early stopping) on a single seed.
+* **What is an Experimental Run?**
+  A **run** is a complete, standalone empirical study of **one dataset**, with **one model architecture**, under **one specific random seed**.
+* **The 120-Run Matrix Calculation**:
+  $$\text{Total Runs} = 4\text{ Benchmark Datasets} \times 3\text{ Model Architectures} \times 10\text{ Random Seeds} = 120\text{ Independent Runs}$$
+
+| Dimension | Count | Details |
+| :--- | :---: | :--- |
+| **Datasets** | 4 | `adult`, `german_credit`, `credit_default`, `bank_marketing` |
+| **Model Families** | 3 | `RandomForest` (Ensemble Trees), `GradientBoosting` (Sequential Trees), `NeuralNetwork` (Deep Tabular MLP) |
+| **Random Seeds** | 10 | `[42, 123, 456, 789, 1010, 2024, 3141, 4567, 5678, 7890]` |
+| **Total Independent Runs** | **120** | **$4 \times 3 \times 10 = 120$ complete training & evaluation pipelines** |
+
+---
+
+### 2. Why Iterate Over 10 Random Seeds? (Statistical Rigor)
+
+In top-tier machine learning research (NeurIPS, ICML, FAccT), evaluating on a single seed or arbitrary train/test split is considered scientifically insufficient:
+1. **Eliminating Lucky / Unlucky Splits**: A single partition could place an unrepresentative distribution of minority groups in the test set. 10 stratified random splits average out stochastic variance.
+2. **Quantifying Variance & Confidence Intervals**: Replicating across 10 independent initializations yields authentic empirical standard deviations ($\mu \pm \sigma$) for accuracy, ECE, Brier score, and group calibration gaps.
+3. **Hypothesis Testing**: Enables paired statistical tests (**Paired Student's $t$-test** and **Wilcoxon Signed-Rank Test** with **Bonferroni correction** in `src/statistical_tests.py`) to formally verify whether compression-induced miscalibration is statistically significant ($p < 0.05$) rather than random chance.
+
+---
+
+### 3. Lifecycle of a Single Experimental Run (Inside `run_single_experiment`)
+
+Each of the 120 runs performs an extensive multi-tier evaluation pipeline:
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. DATA SPLITTING & STRATIFICATION (Zero Data Leakage)                │
+│    • 60% Train Set: Model parameter optimization                      │
+│    • 20% Calibration Set: Held-out for post-hoc recalibrators          │
+│    • 20% Test Set: Strictly untouched final benchmark                  │
+│    • Sensitive demographic attributes isolated before encoding         │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 2. TRAIN UNCOMPRESSED BASELINE MODEL (Tier 0.0)                        │
+│    • Fits full-capacity model (500 trees in RF/GB, or 100 epochs in NN)│
+│    • GPU-accelerated on CUDA for PyTorch Neural Networks               │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 3. PROGRESSIVE CAPACITY COMPRESSION (5 Tiers)                          │
+│    • Tier 0.0: Baseline (100% capacity preserved)                     │
+│    • Tier 0.30: 30% parameters/trees pruned                           │
+│    • Tier 0.50: 50% parameters/trees pruned                           │
+│    • Tier 0.70: 70% parameters/trees pruned                           │
+│    • Tier 0.90: 90% parameters/trees pruned (extreme compression)     │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 4. POST-HOC PROBABILITY RECALIBRATION                                  │
+│    Evaluates 5 recalibration regimes on each compression tier:         │
+│    1. Uncalibrated (Raw model probabilities)                           │
+│    2. Global Platt Scaling (Logistic regression calibrator)            │
+│    3. Global Isotonic Regression (Piecewise non-parametric)            │
+│    4. Group-Specific Platt Scaling (Slices fitted per demographic group│
+│    5. Group-Specific Isotonic Regression                              │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 5. MULTI-LEVEL STATISTICAL EVALUATION & PROFILING                      │
+│    • Overall Calibration: ECE, MCE, Brier Score, Log Loss, Accuracy    │
+│    • Group-Wise Calibration: ECE & MCE computed per demographic slice  │
+│    • Calibration Disparity: Max calibration gap between subgroups      │
+│    • Hardware Efficiency: Parameters, sparsity, disk bytes & latency ms│
+│    • Explainability: SHAP feature attributions on baseline vs 90% prune│
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 6. PROGRESSIVE CHECKPOINTING                                           │
+│    Immediately persists all results to disk (results/results_{dataset})│
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Total Snapshot Evaluations per Run**:
+- 5 compression levels $\times$ 5 recalibration methods $\times$ (1 overall + $G$ demographic groups) $\approx$ **50 to 125 evaluated condition slices per run**.
+- Across all 120 runs, this produces over **10,000+ structured evaluation points** saved into `results/results_all.csv`!
+
+---
+
+### 4. Hardware Acceleration: Utilizing Your GPU
+
+* **PyTorch Tabular MLP (`NeuralNetwork`)**: Automatically detects and leverages your **NVIDIA CUDA GPU** (e.g. GeForce RTX 4080) for batch training, gradient updates, and probability estimation. When dynamic INT8 quantization is evaluated, quantized linear layers automatically execute on CPU as required by PyTorch's quantization engine.
+* **Scikit-Learn Tree Ensembles (`RandomForest`, `GradientBoosting`)**: Scikit-learn CPU algorithms run with full multi-core multiprocessing (`n_jobs=-1`) across all available CPU threads.
+
+> [!TIP]
+> **Enabling CUDA Acceleration in your Virtual Environment**:
+> If your PyTorch was installed from standard PyPI, it may default to the CPU build. To enable full CUDA 12.x hardware acceleration on your NVIDIA GPU:
+> ```powershell
+> pip install torch --index-url https://download.pytorch.org/whl/cu124
+> ```
+> Verify with: `python -c "import torch; print('CUDA Available:', torch.cuda.is_available(), '| GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"`
 
 ## Repository Structure
 

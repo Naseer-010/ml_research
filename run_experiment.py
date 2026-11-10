@@ -56,7 +56,11 @@ from models.neural_network_model import NeuralNetworkModelWrapper
 # ──────────────────────────────────────────────────────────────────────
 # Logging setup
 # ──────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
+logging.basicConfig(
+    level=config.LOG_LEVEL,
+    format=config.LOG_FORMAT,
+    datefmt=getattr(config, "LOG_DATEFMT", "%H:%M:%S"),
+)
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +103,8 @@ def run_single_experiment(
     seed: int,
     save_shap: bool = True,
     nn_mode: str = "prune+quantize",
+    run_idx: Optional[int] = None,
+    total_runs: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Run one model on one dataset with one seed across all compression levels.
 
@@ -114,6 +120,10 @@ def run_single_experiment(
         Whether to compute and save SHAP values (slower).
     nn_mode : str
         Compression mode for NeuralNetwork ('prune+quantize', 'prune_only', 'quantize_only', 'fp16').
+    run_idx : int, optional
+        Current run counter for logging.
+    total_runs : int, optional
+        Total number of runs for logging.
 
     Returns
     -------
@@ -121,9 +131,7 @@ def run_single_experiment(
         List of result rows, one per (compression_level, recalibration_method, group).
     """
     dataset_config = config.DATASETS[dataset_key]
-    logger.info(
-        f"Running: dataset={dataset_key}, model={model_name}, seed={seed}"
-    )
+    run_start = time.perf_counter()
 
     # ── Load and preprocess ──────────────────────────────────────────
     df = load_dataset(dataset_key)
@@ -141,20 +149,28 @@ def run_single_experiment(
 
     input_dim = X_train.shape[1]
 
+    sens_desc = ", ".join([f"{k} ({len(np.unique(v))} groups)" for k, v in groups_test.items()])
+    logger.info(
+        f"  Data Splits: Train={len(y_train):,} (60%) | Cal={len(y_cal):,} (20%) | Test={len(y_test):,} (20%) | Features={input_dim}"
+    )
+    logger.info(f"  Sensitive Groups: {sens_desc}")
+
     # ── Train baseline model ─────────────────────────────────────────
     logger.info(f"  Training baseline {model_name}...")
+    t_train_start = time.perf_counter()
     baseline_model = create_model(model_name, input_dim, seed)
     if model_name == "NeuralNetwork":
         baseline_model.train(X_train, y_train)  # NN creates internal val split
     else:
         baseline_model.train(X_train, y_train, X_val=X_cal, y_val=y_cal)
+    t_train = time.perf_counter() - t_train_start
+    logger.info(f"  Baseline {model_name} trained in {t_train:.2f}s")
 
     results: List[Dict[str, Any]] = []
 
+    logger.info("  Evaluating compression tiers & recalibration:")
     # ── Loop over compression levels ─────────────────────────────────
     for level in config.COMPRESSION_LEVELS:
-        logger.info(f"  Compression level: {level:.0%}")
-
         if level == 0.0:
             current_model = baseline_model
         else:
@@ -267,6 +283,16 @@ def run_single_experiment(
                         **eff_metrics,
                     })
 
+        # Display clean progress summary for this compression level
+        uncal_acc = compute_overall_metrics(y_test, prob_test)["accuracy"]
+        uncal_ece = compute_overall_metrics(y_test, prob_test)["ece"]
+        platt_ece = compute_overall_metrics(y_test, recalibrated_probs["platt"])["ece"]
+        size_kb = eff_metrics["model_size_bytes"] / 1024
+        lat_ms = eff_metrics["latency_mean_ms"]
+        logger.info(
+            f"   -> Tier {level:>4.0%}: Acc={uncal_acc:.1%} | ECE(raw)={uncal_ece:.4f} | ECE(Platt)={platt_ece:.4f} | Size={size_kb:>7.1f} KB | Latency={lat_ms:.2f} ms"
+        )
+
         # ── SHAP explainability (baseline and max compression only) ──
         if save_shap and level in [0.0, config.COMPRESSION_LEVELS[-1]]:
             try:
@@ -275,8 +301,11 @@ def run_single_experiment(
                     dataset_key, model_name, level, seed,
                 )
             except Exception as e:
-                logger.warning(f"  SHAP computation failed: {e}")
+                logger.warning(f"  SHAP computation skipped: {e}")
 
+    run_elapsed = time.perf_counter() - run_start
+    prefix = f"Run {run_idx}/{total_runs}" if run_idx else "Run"
+    logger.info(f"  [OK] {prefix} complete in {run_elapsed:.1f}s")
     return results
 
 
@@ -351,15 +380,27 @@ def run_full_experiment(
     total_runs = len(dataset_keys) * len(seeds) * len(model_names)
     run_idx = 0
 
-    logger.info("=" * 70)
-    logger.info("EXPERIMENT START")
-    logger.info(f"  Datasets:    {dataset_keys}")
-    logger.info(f"  Seeds:       {seeds}")
-    logger.info(f"  Models:      {model_names}")
-    logger.info(f"  Compression: {config.COMPRESSION_LEVELS}")
-    logger.info(f"  NN Mode:     {nn_mode}")
-    logger.info(f"  Total runs:  {total_runs}")
-    logger.info("=" * 70)
+    import torch
+    import os
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        device_info = f"CUDA GPU: {gpu_name} ({gpu_vram:.1f} GB VRAM)"
+    else:
+        device_info = f"CPU ({os.cpu_count()} logical cores)"
+
+    logger.info("=" * 76)
+    logger.info("  GROUP-WISE CALIBRATION IN COMPRESSED TABULAR MODELS")
+    logger.info("=" * 76)
+    logger.info(f"  Datasets       : {dataset_keys}")
+    logger.info(f"  Models         : {model_names}")
+    logger.info(f"  Random Seeds   : {seeds} ({len(seeds)} seeds)")
+    logger.info(f"  Total Runs     : {total_runs} (Datasets x Models x Seeds)")
+    logger.info(f"  Compression    : {[f'{c:.0%}' for c in config.COMPRESSION_LEVELS]}")
+    logger.info(f"  NN Mode        : {nn_mode}")
+    logger.info(f"  Compute Device : {device_info}")
+    logger.info(f"  Results Path   : {config.RESULTS_DIR}")
+    logger.info("=" * 76)
 
     start_time = time.time()
 
@@ -369,17 +410,30 @@ def run_full_experiment(
         for seed in seeds:
             for model_name in model_names:
                 run_idx += 1
+                pct = (run_idx / total_runs) * 100
+                logger.info("-" * 76)
                 logger.info(
-                    f"\n[{run_idx}/{total_runs}] "
-                    f"dataset={dataset_key}, model={model_name}, seed={seed}"
+                    f"  [RUN {run_idx:03d}/{total_runs:03d} | {pct:>5.1f}%]  Dataset: {dataset_key:<14} | Model: {model_name:<16} | Seed: {seed}"
                 )
+                logger.info("-" * 76)
 
                 try:
                     results = run_single_experiment(
-                        dataset_key, model_name, seed, save_shap=save_shap, nn_mode=nn_mode
+                        dataset_key=dataset_key,
+                        model_name=model_name,
+                        seed=seed,
+                        save_shap=save_shap,
+                        nn_mode=nn_mode,
+                        run_idx=run_idx,
+                        total_runs=total_runs,
                     )
                     dataset_results.extend(results)
                     all_results.extend(results)
+
+                    # Progressive checkpoint save so completed runs are never lost
+                    df_dataset = pd.DataFrame(dataset_results)
+                    csv_path = config.RESULTS_DIR / f"results_{dataset_key}.csv"
+                    df_dataset.to_csv(csv_path, index=False)
                 except Exception as e:
                     logger.error(
                         f"  FAILED: {dataset_key}/{model_name}/seed={seed}: {e}",
@@ -399,10 +453,10 @@ def run_full_experiment(
     df_all.to_csv(combined_path, index=False)
 
     elapsed = time.time() - start_time
-    logger.info("=" * 70)
-    logger.info(f"EXPERIMENT COMPLETE — {len(df_all)} result rows in {elapsed:.1f}s")
+    logger.info("=" * 76)
+    logger.info(f"EXPERIMENT COMPLETE — {len(df_all):,} result rows saved in {elapsed:.1f}s")
     logger.info(f"Results saved to: {combined_path}")
-    logger.info("=" * 70)
+    logger.info("=" * 76)
 
     return df_all
 

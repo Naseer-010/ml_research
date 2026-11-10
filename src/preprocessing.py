@@ -37,12 +37,12 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
+if not logger.handlers and not logging.getLogger().handlers:
     _handler = logging.StreamHandler()
-    _formatter = logging.Formatter(config.LOG_FORMAT)
+    _formatter = logging.Formatter(config.LOG_FORMAT, datefmt=getattr(config, "LOG_DATEFMT", "%H:%M:%S"))
     _handler.setFormatter(_formatter)
     logger.addHandler(_handler)
-    logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
 
 
 class PreparedData(dict):
@@ -336,17 +336,21 @@ def identify_column_types(
 
     for col in df.columns:
         dtype = df[col].dtype
-        is_object_or_cat = (
-            isinstance(dtype, pd.CategoricalDtype)
-            or dtype.name in ["object", "string", "category", "bool"]
+        is_categorical = (
+            isinstance(dtype, (pd.CategoricalDtype, pd.StringDtype))
+            or pd.api.types.is_string_dtype(dtype)
+            or pd.api.types.is_object_dtype(dtype)
+            or pd.api.types.is_bool_dtype(dtype)
+            or dtype.name in ["object", "string", "category", "bool", "str"]
+            or "string" in str(dtype).lower()
         )
 
-        if is_object_or_cat:
+        if is_categorical:
             categorical_cols.append(col)
         elif col in sensitive_columns and df[col].nunique() <= 20:
             # Sensitive columns with discrete levels are treated as categorical
             categorical_cols.append(col)
-        elif np.issubdtype(dtype, np.number):
+        elif pd.api.types.is_numeric_dtype(dtype):
             numerical_cols.append(col)
         else:
             categorical_cols.append(col)
@@ -518,9 +522,14 @@ def preprocess_dataset(
     preprocessor.fit(X_train_df)
 
     # 7. Transform train, calibration, and test sets
-    X_train = np.asarray(preprocessor.transform(X_train_df), dtype=np.float32)
-    X_cal = np.asarray(preprocessor.transform(X_cal_df), dtype=np.float32)
-    X_test = np.asarray(preprocessor.transform(X_test_df), dtype=np.float32)
+    def _to_dense_f32(arr: Any) -> np.ndarray:
+        if hasattr(arr, "toarray"):
+            arr = arr.toarray()
+        return np.asarray(arr, dtype=np.float32)
+
+    X_train = _to_dense_f32(preprocessor.transform(X_train_df))
+    X_cal = _to_dense_f32(preprocessor.transform(X_cal_df))
+    X_test = _to_dense_f32(preprocessor.transform(X_test_df))
 
     # 8. Feature names matching the order of ColumnTransformer
     feature_names = list(num_cols) + list(cat_cols)
