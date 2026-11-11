@@ -21,13 +21,6 @@ venv.bak/
 data/*
 !data/.gitkeep
 
-# Experiment outputs, generated results, saved weights, and plots
-results/*.csv
-results/plots/*
-!results/plots/.gitkeep
-results/saved_models/*
-!results/saved_models/.gitkeep
-results/shap/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
